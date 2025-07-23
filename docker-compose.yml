@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  superocr:
+    build: .
+    container_name: superocr-app
+    restart: unless-stopped
+    
+    # GPU поддержка (требует nvidia-docker)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    # Порты
+    ports:
+      - "5900:5900"  # VNC
+      - "6080:6080"  # noVNC (если используется)
+    
+    # Монтирование томов
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./local.env:/app/local.env:ro
+    
+    # Переменные окружения
+    environment:
+      - DISPLAY=:99
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    
+    # Сетевые настройки
+    networks:
+      - superocr-network
+
+  # noVNC веб-интерфейс (опционально)
+  novnc:
+    image: theasp/novnc:latest
+    container_name: superocr-novnc
+    restart: unless-stopped
+    ports:
+      - "6080:8080"
+    environment:
+      - DISPLAY_WIDTH=1024
+      - DISPLAY_HEIGHT=768
+      - VNC_SERVER=superocr:5900
+    depends_on:
+      - superocr
+    networks:
+      - superocr-network
+
+networks:
+  superocr-network:
+    driver: bridge
+
+volumes:
+  superocr-data:
+    driver: local

@@ -1,0 +1,30 @@
+# SuperOCR - Основные зависимости
+# Для установки: pip install -r requirements.txt
+
+# PyTorch (установить отдельно с CUDA поддержкой)
+# torch>=2.0.0
+# torchvision>=0.15.0
+# torchaudio>=2.0.0
+
+# Основные библиотеки
+surya-ocr>=0.4.0
+requests>=2.28.0
+pillow>=9.0.0
+numpy>=1.21.0
+opencv-python>=4.6.0
+
+# PDF обработка
+pdf2image>=3.1.0
+pymupdf>=1.20.0
+
+# Конфигурация
+python-dotenv>=0.19.0
+
+# Дополнительные зависимости для Linux
+# xvfb (системная зависимость)
+# x11vnc (системная зависимость)
+
+# Для разработки (опционально)
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0
