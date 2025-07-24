@@ -39,12 +39,14 @@ COPY gui_run.py .
 COPY surya/ ./surya/
 COPY *.md ./
 
-# Создание виртуального окружения и установка зависимостей
+# Создание виртуального окружения и установка зависимостей (правильная последовательность)
 RUN python3 -m venv surya_env && \
     . surya_env/bin/activate && \
     pip install --upgrade pip setuptools wheel && \
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && \
-    pip install -r requirements.txt
+    pip install -r requirements.txt && \
+    pip install surya-ocr==0.14.6 --no-deps && \
+    pip install pydantic pydantic-settings filetype pre-commit && \
+    pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 
 # Создание директорий для данных
 RUN mkdir -p /app/data/input /app/data/output /app/logs
@@ -69,7 +71,8 @@ python3 gui_run.py' > /app/start_vnc.sh && \
     chmod +x /app/start_vnc.sh
 
 # Открытие портов
-EXPOSE 5900 6080
+# 5900 - VNC, 6080 - noVNC, 1234 - LM Studio API
+EXPOSE 5900 6080 1234
 
 # Создание пользователя без root прав
 RUN useradd -m -s /bin/bash superocr && \

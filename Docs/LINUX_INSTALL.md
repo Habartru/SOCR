@@ -5,7 +5,7 @@
 ## 📋 Системные требования
 
 - **ОС**: Ubuntu 20.04+ / CentOS 8+ / Debian 11+
-- **Python**: 3.8+
+- **Python**: 3.10.x (обязательно для совместимости)
 - **GPU**: NVIDIA GPU с CUDA 11.8+ (рекомендуется)
 - **ОЗУ**: Минимум 8GB, рекомендуется 16GB+
 - **Место на диске**: 10GB+ свободного места
@@ -67,19 +67,26 @@ python3 -m venv surya_env
 source surya_env/bin/activate
 ```
 
-### 6. Установка Python зависимостей
+### 6. Установка Python зависимостей (Правильная последовательность)
 
 ```bash
 # Обновление pip
 pip install --upgrade pip setuptools wheel
 
-# Установка PyTorch с CUDA поддержкой
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# Шаг 1: Установка основных зависимостей
+pip install -r requirements.txt
 
-# Установка основных зависимостей
-pip install surya-ocr requests pillow numpy opencv-python
-pip install pdf2image pymupdf python-dotenv
+# Шаг 2: Установка Surya OCR БЕЗ зависимостей (важно!)
+pip install surya-ocr==0.14.6 --no-deps
+
+# Шаг 3: Установка недостающих зависимостей Surya
+pip install pydantic pydantic-settings filetype pre-commit
+
+# Шаг 4: Обновление PyTorch для совместимости с Surya OCR
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 ```
+
+**Важно:** Порядок установки критичен! Не меняйте последовательность.
 
 ### 7. Настройка окружения
 
