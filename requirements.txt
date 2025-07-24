@@ -2,9 +2,9 @@
 # Для установки: pip install -r requirements.txt
 
 # PyTorch CUDA 11.8 - совместимая группа версий
-torch==2.7.1+cu118
+torch==2.3.1+cu118
 torchvision==0.18.1+cu118
-torchaudio==2.7.1+cu118
+torchaudio==2.3.1+cu118
 
 # Основные библиотеки
 surya-ocr==0.14.6

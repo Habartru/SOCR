@@ -5,13 +5,10 @@ title SuperOCR GPU Installer - Windows
 
 color 0A
 echo.
-echo    ╔═══════════════════════════════════════════════════════════════╗
-echo    ║                                                               ║
-echo    ║                   🚀 SuperOCR GPU Installer                   ║
-echo    ║                                                               ║
-echo    ║              Advanced OCR with CUDA Acceleration              ║
-echo    ║                                                               ║
-echo    ╚═══════════════════════════════════════════════════════════════╝
+echo ===========================================
+echo    SuperOCR GPU Installer
+echo    Advanced OCR with CUDA Acceleration
+echo ===========================================
 echo.
 
 :: Check if running as administrator
@@ -64,7 +61,7 @@ python -m pip install --upgrade pip
 
 :: Install PyTorch CUDA first
 echo 🚀 Installing PyTorch with CUDA 11.8...
-pip install torch==2.7.1+cu118 torchvision==0.18.1+cu118 torchaudio==2.7.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.3.1+cu118 torchvision==0.18.1+cu118 torchaudio==2.3.1+cu118 --index-url https://download.pytorch.org/whl/cu118
 
 :: Install Surya OCR and dependencies
 echo 📦 Installing Surya OCR and dependencies...
@@ -77,6 +74,9 @@ python -c "import torch; print('PyTorch version:', torch.__version__); print('CU
 
 echo Testing Surya OCR...
 python -c "from surya.detection import DetectionPredictor; print('✅ Surya OCR ready!')"
+
+:: Get current directory
+cd /d "%~dp0"
 
 :: Create desktop shortcut
 echo 🖥️  Creating desktop shortcut...
@@ -97,6 +97,7 @@ echo.
 echo 🎉 Installation completed successfully!
 echo.
 echo 🚀 Launching SuperOCR...
+call surya_env\Scripts\activate.bat
 python gui_run.py
 
 pause
