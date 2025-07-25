@@ -36,6 +36,9 @@ from surya.detection import DetectionPredictor
 from surya.recognition import RecognitionPredictor
 from surya.common.surya.schema import TaskNames
 
+# Импорт для подсчета токенов
+from token_counter import smart_truncate_for_llm, check_context_limit
+
 
 def ocr_worker(pdf_queue, ocr_queue, pdf_folder, date_format):
     """OCR воркер: непрерывно обрабатывает PDF и подает в OCR очередь"""
@@ -133,19 +136,25 @@ def llm_worker(ocr_queue, result_queue, json_folder, llm_settings, model_name, w
                 with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump(llm_result, f, ensure_ascii=False, indent=2)
                 
-                result_queue.put(f"Завершено [{display_name}]: {pdf_file} (время: {processing_time:.1f}с)")
+                # Передаем тип документа для статистики
+                doc_type = llm_result.get("Тип_документа", llm_result.get("Тип документа", "не указан"))
+                result_queue.put(f"Завершено [{display_name}]: {pdf_file} (время: {processing_time:.1f}с) - {doc_type}")
             else:
                 # Ошибка LLM - проверяем возможность повтора
                 max_retries = llm_settings.get('max_retries', 3)
                 auto_retry = llm_settings.get('auto_retry', True)
                 
+                # Правильная проверка: retry_count начинается с 0, максимум max_retries попыток
                 if auto_retry and retry_count < max_retries and retry_queue is not None:
                     # Добавляем в очередь повтора
                     retry_queue.put((pdf_file, truncated_data, combined_text, retry_count + 1))
-                    result_queue.put(f"Повтор [{display_name}] для {pdf_file}: {llm_result['error']} (попытка {retry_count + 1}/{max_retries})")
+                    result_queue.put(f"Повтор [{display_name}] для {pdf_file}: {llm_result['error']} (попытка {retry_count + 2}/{max_retries + 1})")
                 else:
                     # Максимум попыток исчерпан или автоповтор отключен
-                    result_queue.put(f"Ошибка LLM [{display_name}] для {pdf_file}: {llm_result['error']} (время: {processing_time:.1f}с, попытка {retry_count + 1})")
+                    if "prediction-error" in llm_result.get('error', '').lower():
+                        result_queue.put(f"Ошибка LLM [{display_name}] для {pdf_file}: Превышен контекст модели - документ слишком большой (время: {processing_time:.1f}с, попытка {retry_count + 1}/{max_retries + 1})")
+                    else:
+                        result_queue.put(f"Ошибка LLM [{display_name}] для {pdf_file}: {llm_result['error']} (время: {processing_time:.1f}с, попытка {retry_count + 1}/{max_retries + 1})")
                 
         except queue.Empty:
             continue
@@ -236,18 +245,19 @@ def ocr_single_file_worker(pdf_file, pdf_folder, date_format):
             date_str = datetime.now().strftime("%Y-%m-%d" if date_format == "ISO" else "%d.%m.%Y")
             writer.writerow([pdf_file, date_str, json.dumps(ocr_json, ensure_ascii=False), combined_text.strip()])
         
-        # Подготовка данных для LLM (ПРАВИЛЬНАЯ ЛОГИКА!)
-        if len(pages_data) == 1:
-            # ОДНА СТРАНИЦА - передаем ПОЛНОСТЬЮ
-            truncated_lines = [{"source": "single_page", **line} for line in pages_data[0]["text_lines"]]
+        # Подготовка данных для LLM с умным усечением
+        all_lines = []
+        for page_data in pages_data:
+            all_lines.extend(page_data["text_lines"])
+        
+        # Применяем умное усечение с точным подсчетом токенов
+        max_tokens = 12000  # Оставляем место для промпта (4000 токенов)
+        truncated_lines, token_count, was_truncated = smart_truncate_for_llm(all_lines, max_tokens)
+        
+        if was_truncated:
+            print(f"✂️ Документ {pdf_file} усечен: {token_count} токенов")
         else:
-            # МНОГОСТРАНИЧНЫЕ - только 10 первых + 30 последних
-            truncated_lines = []
-            first_page_lines = pages_data[0]["text_lines"]
-            truncated_lines.extend([{"source": "first_page", **line} for line in first_page_lines[:10]])
-            last_page_lines = pages_data[-1]["text_lines"]
-            start_idx = max(0, len(last_page_lines) - 30)
-            truncated_lines.extend([{"source": "last_page", **line} for line in last_page_lines[start_idx:]])
+            print(f"✅ Документ {pdf_file} помещается: {token_count} токенов")
         
         processing_time = time.time() - start_time
         return {
@@ -328,20 +338,23 @@ def process_single_file_worker(args):
             date_str = datetime.now().strftime("%Y-%m-%d" if date_format == "ISO" else "%d.%m.%Y")
             writer.writerow([pdf_file, date_str, json.dumps(ocr_json, ensure_ascii=False), combined_text.strip()])
         
-        # Подготовка усеченных данных для LLM
-        truncated_lines = []
-        if pages_data:
-            # Первые 10 строк с первой страницы
-            first_page_lines = pages_data[0]["text_lines"]
-            truncated_lines.extend([{"source": "first_page", **line} for line in first_page_lines[:10]])
-            
-            # Последние 30 строк с последней страницы
-            last_page_lines = pages_data[-1]["text_lines"]
-            start_idx = max(0, len(last_page_lines) - 30)
-            truncated_lines.extend([{"source": "last_page", **line} for line in last_page_lines[start_idx:]])
+        # Подготовка данных для LLM с умным усечением
+        all_lines = []
+        for page_data in pages_data:
+            all_lines.extend(page_data["text_lines"])
+        
+        # Проверяем размер и применяем умное усечение
+        max_tokens = 12000  # Оставляем 4000 токенов для промпта
+        truncated_lines, token_count, was_truncated = smart_truncate_for_llm(all_lines, max_tokens)
+        
+        if was_truncated:
+            print(f"✂️ Документ {pdf_file} усечен: {token_count} токенов")
+        else:
+            print(f"✅ Документ {pdf_file} помещается: {token_count} токенов")
         
         # Анализ с LLM
-        llm_result = analyze_with_llm_worker(pdf_file, truncated_lines, llm_settings)
+        model_name = llm_settings.get('models', ['local-1'])[0]  # Берем первую модель
+        llm_result = analyze_with_llm_worker(pdf_file, truncated_lines, llm_settings, model_name)
         
         if "error" not in llm_result:
             # Валидация
@@ -362,79 +375,98 @@ def process_single_file_worker(args):
         return f"Ошибка обработки {pdf_file}: {str(e)}"
 
 
-def analyze_with_llm_worker(filename, truncated_data, llm_settings, model_name):
-    """Анализ с LLM (вне класса)"""
-    try:
-        structured_data = json.dumps(truncated_data, ensure_ascii=False, indent=2)
-        
-        prompt = f"""Ты эксперт по анализу российских деловых документов.
+def generate_llm_prompt(filename, truncated_data, structured_data):
+    """Генерация улучшенного промпта для LLM с четким определением ролей и предотвращением дублирования типа документа"""
+    prompt = f"""Ты эксперт по извлечению данных из российских деловых документов. Анализируй текст и извлеки структурированную информацию строго по правилам.
 
-К тебе приходят УСЕЧЕННЫЕ СТРУКТУРИРОВАННЫЕ данные от Surya OCR с координатами (bbox) каждой строки. Фокус на ключевых частях: первые строки (заголовки, реквизиты, тип, номер, дата, стороны) и последние (адреса, подписи, ИНН, КПП, итоги).
+ВАЖНО: В JSON ответе должно быть ТОЛЬКО ОДНО поле с типом документа - "Тип_документа" - без вариаций, дублирования или альтернатив!
 
-КООРДИНАТЫ помогают понять РАСПОЛОЖЕНИЕ:
-- Малые X = левая часть, большие X = правая часть
-- Малые Y = верх страницы, большие Y = низ страницы
+ОПРЕДЕЛЕНИЕ РОЛЕЙ (САМОЕ ВАЖНОЕ) В каждом документе всегда 2 стороны и в ответе должны быть 2 стороны:
+1. ИСПОЛНИТЕЛЬ (кто оказывает услуги/продает товары):
+   - В договоре: "Исполнитель", "Продавец", "Поставщик", изучай стороны договора чтобы решить.
+   - В акте: "Исполнитель", тот кто выполнил работы/оказал услуги
+   - В счете: "Поставщик", "ИП" или организация в верхней части счета
 
-КРИТИЧЕСКИ ВАЖНО! ЛОГИКА ОПРЕДЕЛЕНИЯ РОЛЕЙ:
-1. АКТ выполненных работ/услуг:
-   - ИСПОЛНИТЕЛЬ = тот, кто ВЫПОЛНИЛ работы (обычно слева или подписывает акт)
-   - ЗАКАЗЧИК = тот, кто ПРИНИМАЕТ работы (обычно справа)
-   - Пример: "Автоассистанс" выполнил услуги для "Деалон"
+2. ЗАКАЗЧИК (кто платит/получает услуги/товары):
+   - В договоре: "Заказчик", "Покупатель", "Получатель", сторона документа, изучи чтобы решить кто есть кто.
+   - В акте: "Заказчик", тот кому оказаны услуги
+   - В счете: "Покупатель", "Плательщик", получатель счета
 
-2. СЧЕТ на оплату:
-   - ИСПОЛНИТЕЛЬ = поставщик, кто ВЫСТАВЛЯЕТ счет (получатель денег)
-   - ЗАКАЗЧИК = плательщик, кому выставлен счет (платит деньги)
+ОПРЕДЕЛЕНИЕ ТИПА ДОКУМЕНТА (ТОЛЬКО ОДИН ТИП - БЕЗ ДУБЛИРОВАНИЯ!):
+- "договор" - если в заголовке есть слова "договор", "соглашение", "купли-продажи"
+- "акт" - если в заголовке есть слова "акт", "выполненных работ", "оказанных услуг"
+- "счет" - если в заголовке есть "счет", "счет на оплату"
+- "счет-фактура" - если в заголовке есть "счет-фактура"
 
-3. СЧЕТ-ФАКТУРА:
-   - ИСПОЛНИТЕЛЬ = продавец, кто ПОСТАВЛЯЕТ товары/услуги
-   - ЗАКАЗЧИК = покупатель, кто ПОЛУЧАЕТ товары/услуги
+ТИПЫ ОРГАНИЗАЦИЙ (определи точно):
+- "юрлицо" - ООО, АО, ПАО, ГУП, МУП, ФГУП (ИНН 10 цифр, КПП 9 цифр)
+- "ип" - ИП, Индивидуальный предприниматель (ИНН 12 цифр, без КПП)
+- "физлицо" - Ф.И.О. без указания ООО/ИП (возможно ИНН 12 цифр)
 
-4. ДОГОВОР:
-   - Смотри на контекст: кто поставщик, кто заказчик
+ПРАВИЛА ИЗВЛЕЧЕНИЯ ДАННЫХ:
+- Название организации: только официальное название (ООО "Название", ИП Иванов А.А., либо физ лицо - Иванов А.А.)
+- ИНН: только числа длиной 10 цифр (юрлица) или 12 цифр (ИП/физлица)
+- КПП: только 9 цифр (только для юрлиц!)
+- Адрес: полный юридический адрес без названия организации
 
-ОПРЕДЕЛЕНИЕ ТИПА ДОКУМЕНТА:
-- Если видишь "АКТ" - это Акт
-- Если видишь "СЧЕТ" (но не "счет-фактура") - это Счёт
-- Если видишь "СЧЕТ-ФАКТУРА" - это Счет-фактура
-- Если видишь "ДОГОВОР" - это Договор
+ПРИМЕРЫ ОПРЕДЕЛЕНИЯ РОЛЕЙ:
+- В договоре купли-продажи автомобиля: Продавец = ИСПОЛНИТЕЛЬ, Покупатель = ЗАКАЗЧИК
+- В акте выполненных работ: кто выполнил работы = ИСПОЛНИТЕЛЬ, кто принял = ЗАКАЗЧИК
+- В счете: кто выставил счет = ИСПОЛНИТЕЛЬ, кому выставлен счет = ЗАКАЗЧИК
 
-ПРАВИЛА ИЗВЛЕЧЕНИЯ:
-1. ИНН: ТОЛЬКО 10 или 12 цифр (не путай с номерами счетов!)
-2. КПП: ТОЛЬКО 9 цифр
-3. Номер документа: без "от", "№", дат - только цифры/буквы
-4. Используй координаты для группировки связанных данных
-
-СТРУКТУРИРОВАННЫЕ ДАННЫЕ SURYA OCR (усеченные):
+ДОКУМЕНТ:
 {structured_data}
 
-АНАЛИЗИРУЙ ПОШАГОВО:
-1. Определи тип документа (фокус на первых строках)
-2. Найди номер и дату документа (обычно в первых)
-3. Определи, кто ЗАКАЗЧИК (получает услуги), кто ИСПОЛНИТЕЛЬ (оказывает услуги)
-4. Извлеки ИНН, КПП, адреса каждой стороны (часто в последних для подписей)
-5. Проверь правильность ИНН (10-12 цифр) и КПП (9 цифр)
-
-Верни результат ТОЛЬКО в JSON формате:
+ВЕРНИ СТРОГО ФОРМАТИРОВАННЫЙ JSON В ТОЧНОМ СООТВЕТСТВИИ С ШАБЛОНОМ НИЖЕ. ТОЧНО СОБЛЮДАЙ ИМЕНА ПОЛЕЙ (с подчеркиванием, не с пробелами):
 {{
-  "Название файла": "{filename}",
-  "Тип документа": "Акт|Счёт|Счет-фактура|Договор" (выбрать только одно!),
-  "Номер документа": "",
-  "Дата документа": "",
-  "Наименование заказчика": "",
-  "Наименование исполнителя": "",
-  "ИНН заказчика": "",
-  "ИНН исполнителя": "",
-  "КПП заказчика": "",
-  "КПП исполнителя": "",
-  "Адрес заказчика": "",
-  "Адрес исполнителя": ""
+  "Название_файла": "{filename}",
+  "Тип_документа": "договор",  // ТОЛЬКО ОДНО ПОЛЕ С ТИПОМ! Используй "договор", "акт", "счет" или "счет-фактура" в нижнем регистре
+  "Номер_документа": "",
+  "Дата_документа": "",
+  "Наименование_заказчика": "",
+  "Наименование_исполнителя": "",
+  "ИНН_заказчика": "",  // 10 или 12 цифр, не путай с КПП!
+  "КПП_заказчика": "",  // 9 цифр, только для юрлиц
+  "Адрес_заказчика": "",
+  "ИНН_исполнителя": "",  // 10 или 12 цифр, не путай с КПП!
+  "КПП_исполнителя": "",  // 9 цифр, только для юрлиц
+  "Адрес_исполнителя": "",
+  "Тип_заказчика": "юрлицо",  // строго одно из: юрлицо, ип, физлицо
+  "Тип_исполнителя": "юрлицо"  // строго одно из: юрлицо, ип, физлицо
 }}"""
+    return prompt
 
-        # Балансировка модели
-        model_index = llm_settings.get('model_index', 0)
-        models = llm_settings.get('models', ['local-1', 'local-2'])
-        model = model_name
+
+def analyze_document(filename, truncated_data, llm_settings, model_name):
+    """Обработка документа с LLM"""
+    try:
+        # Проверка наличия данных
+        if not truncated_data or len(truncated_data) == 0:
+            return {"error": "Пустые данные OCR"}
         
+        structured_data = json.dumps(truncated_data, ensure_ascii=False, indent=2)
+        
+        # Логируем размер данных для отладки
+        data_size = len(structured_data)
+        print(f"📊 Отправляем в LLM: {filename}, размер {data_size} байт")
+        
+        # Генерируем промпт
+        prompt = generate_llm_prompt(filename, truncated_data, structured_data)
+        
+        return send_to_llm(prompt, llm_settings, model_name)
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def analyze_with_llm_worker(filename, truncated_data, llm_settings, model_name):
+    """Основная функция анализа документа с LLM"""
+    return analyze_document(filename, truncated_data, llm_settings, model_name)
+
+
+def send_to_llm(prompt, llm_settings, model_name):
+    """Отправка промпта в LLM и надежная обработка JSON-ответов"""
+    try:
         # Поддержка OpenAI и LM Studio
         provider = llm_settings.get('provider', 'LM Studio')
         
@@ -466,75 +498,236 @@ def analyze_with_llm_worker(filename, truncated_data, llm_settings, model_name):
                 endpoint, headers=headers, json=data, 
                 timeout=llm_settings.get('timeout', 180)
             )
+        except requests.exceptions.Timeout:
+            return {"error": f"Таймаут соединения с {provider} (более 180с)"}
+        except requests.exceptions.ConnectionError:
+            return {"error": f"Не удалось подключиться к {provider} - проверьте LM Studio"}
         except Exception as e:
             return {"error": f"Ошибка связи с {provider}: {e}"}
         
         if response.status_code == 200:
-            result = response.json()
-            content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-            
-            start = content.find('{')
-            end = content.rfind('}') + 1
-            if start != -1 and end != -1:
-                json_str = content[start:end]
-                return json.loads(json_str)
-        
-        return {"error": "Не удалось извлечь JSON"}
+            try:
+                result = response.json()
+                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+                
+                if not content:
+                    return {"error": "Пустой ответ от модели"}
+                
+                # Поиск и извлечение JSON-блока
+                start = content.find('{')
+                end = content.rfind('}') + 1
+                
+                if start != -1 and end != -1:
+                    json_str = content[start:end]
+                    
+                    # Предварительная обработка для исправления часто встречающихся ошибок JSON
+                    json_str = fix_json_format(json_str)
+                    
+                    try:
+                        return json.loads(json_str)
+                    except json.JSONDecodeError as e:
+                        # Дополнительная попытка восстановления с более агрессивной обработкой
+                        json_str = aggressive_json_repair(json_str)
+                        try:
+                            return json.loads(json_str)
+                        except json.JSONDecodeError:
+                            # Если снова не удалось, возвращаем детали ошибки
+                            return {"error": f"Не удалось распарсить JSON: {e}\nФрагмент ответа: {json_str[:100]}..."}
+                else:
+                    return {"error": f"Не найден JSON в ответе: {content[:200]}..."}
+                
+            except json.JSONDecodeError as e:
+                return {"error": f"Ошибка парсинга JSON: {e}"}
+            except Exception as e:
+                return {"error": f"Неизвестная ошибка при обработке ответа: {e}"}
+                
+        elif response.status_code == 400:
+            # Ошибка превышения контекста (LM Studio)
+            try:
+                error_detail = response.json().get('error', '')
+                if 'context' in error_detail.lower() or 'token' in error_detail.lower():
+                    return {"error": "prediction-error: Превышен контекст модели"}
+                else:
+                    return {"error": f"prediction-error: {error_detail}"}
+            except:
+                return {"error": "prediction-error: Превышен контекст модели"}
+        elif response.status_code == 422:
+            # Ошибка превышения контекста (OpenAI)
+            try:
+                error_detail = response.json().get('detail', '')
+                if 'context' in error_detail.lower() or 'token' in error_detail.lower():
+                    return {"error": "prediction-error: Превышен контекст модели"}
+                else:
+                    return {"error": f"prediction-error: {error_detail}"}
+            except:
+                return {"error": "prediction-error: Превышен контекст модели"}
+        else:
+            try:
+                error_detail = response.json()
+                return {"error": f"HTTP {response.status_code}: {error_detail}"}
+            except:
+                return {"error": f"HTTP {response.status_code}: {response.text[:200]}"}
         
     except Exception as e:
         return {"error": str(e)}
 
 
+def fix_json_format(json_str):
+    """Исправляет наиболее частые ошибки в JSON-строке"""
+    import re
+    
+    # Заменяем одинарные кавычки на двойные вокруг ключей и строковых значений
+    json_str = re.sub(r"([\{\s,]+)'([^']+)'\s*:", r'\1"\2":', json_str)
+    json_str = re.sub(r":\s*'([^']+)'([\s,\}]+)", r':"\1"\2', json_str)
+    
+    # Исправляем ключи без кавычек (наиболее частая ошибка)
+    json_str = re.sub(r"([\{\s,]+)([A-Za-zА-Яа-я0-9_]+)\s*:", r'\1"\2":', json_str)
+    
+    # Убираем комментарии в стиле JavaScript
+    json_str = re.sub(r"//[^\n]*", "", json_str)
+    
+    # Удаляем последние запятые перед закрывающими скобками (trailing commas)
+    json_str = re.sub(r',\s*\}', '}', json_str)
+    
+    # Преобразуем \n в пробелы внутри строковых значений
+    in_string = False
+    result = []
+    for char in json_str:
+        if char == '"' and (not result or result[-1] != '\\'):
+            in_string = not in_string
+        if in_string and char == '\n':
+            result.append(' ')
+        else:
+            result.append(char)
+    
+    return ''.join(result)
+
+
+def aggressive_json_repair(json_str):
+    """Агрессивное восстановление JSON при серьезных ошибках формата"""
+    import re
+    
+    # Основная обработка
+    json_str = fix_json_format(json_str)
+    
+    # Дополнительные агрессивные исправления
+    
+    # Исправляем пропущенные запятые между объектами
+    json_str = re.sub(r'("[^"]*")\s*("[^"]*"\s*:)', r'\1,\2', json_str)
+    
+    # Заменяем неэкранированные кавычки в строковых значениях
+    in_string = False
+    quote_start = -1
+    result = []
+    
+    for i, char in enumerate(json_str):
+        if char == '"' and (i == 0 or json_str[i-1] != '\\'):
+            if not in_string:
+                in_string = True
+                quote_start = i
+            else:
+                in_string = False
+                
+        # Если внутри строки и нашли неэкранированную кавычку - экранируем её
+        if in_string and char == '"' and i != quote_start and json_str[i-1] != '\\':
+            result.append('\\')
+            
+        result.append(char)
+    
+    return ''.join(result)
+
+
 def validate_llm_result(llm_result, original_text):
-    """Валидация результатов LLM (вне класса)"""
+    """Валидация результатов LLM и исправление форматирования ключей и значений"""
     if "error" in llm_result:
         return llm_result
         
     try:
         import re
+        normalized_result = {}
         
-        # Валидация ИНН
-        for key in ["ИНН заказчика", "ИНН исполнителя"]:
-            inn = llm_result.get(key, "")
+        # Нормализация ключей: преобразование всех ключей в формат с подчеркиванием
+        key_mapping = {
+            # Ключи с пробелами -> ключи с подчеркиванием
+            "Тип документа": "Тип_документа",
+            "Номер документа": "Номер_документа",
+            "Дата документа": "Дата_документа",
+            "Название файла": "Название_файла",
+            "Наименование заказчика": "Наименование_заказчика",
+            "Наименование исполнителя": "Наименование_исполнителя",
+            "ИНН заказчика": "ИНН_заказчика",
+            "КПП заказчика": "КПП_заказчика",
+            "Адрес заказчика": "Адрес_заказчика",
+            "ИНН исполнителя": "ИНН_исполнителя",
+            "КПП исполнителя": "КПП_исполнителя",
+            "Адрес исполнителя": "Адрес_исполнителя",
+            "Тип заказчика": "Тип_заказчика",
+            "Тип исполнителя": "Тип_исполнителя"
+        }
+        
+        # Перенос всех значений с нормализацией ключей
+        for key, value in llm_result.items():
+            normalized_key = key_mapping.get(key, key)
+            normalized_result[normalized_key] = value
+        
+        # Если был дублирующий тип документа, исправляем
+        doc_type_keys = ["Тип_документа", "Тип документа"]
+        found_doc_type = None
+        for key in doc_type_keys:
+            if key in normalized_result:
+                found_doc_type = normalized_result[key].lower()
+                # Удаляем ключ с пробелом, оставляем только с подчеркиванием
+                if key == "Тип документа" and "Тип_документа" not in normalized_result:
+                    normalized_result["Тип_документа"] = found_doc_type
+                    del normalized_result[key]
+        
+        # Валидация и нормализация ИНН
+        for key in ["ИНН_заказчика", "ИНН_исполнителя"]:
+            inn = normalized_result.get(key, "")
             if inn and not (inn.isdigit() and len(inn) in [10, 12]):
                 inn_matches = re.findall(r'\b\d{10}\b|\b\d{12}\b', original_text)
                 if inn_matches:
-                    llm_result[key] = inn_matches.pop(0) if "заказчика" in key else inn_matches.pop(0) if inn_matches else ""
+                    normalized_result[key] = inn_matches.pop(0) if "заказчика" in key else inn_matches.pop(0) if inn_matches else ""
         
-        # Валидация КПП
-        for key in ["КПП заказчика", "КПП исполнителя"]:
-            kpp = llm_result.get(key, "")
+        # Валидация и нормализация КПП
+        for key in ["КПП_заказчика", "КПП_исполнителя"]:
+            kpp = normalized_result.get(key, "")
             if kpp and not (kpp.isdigit() and len(kpp) == 9):
                 kpp_matches = re.findall(r'\b\d{9}\b', original_text)
                 if kpp_matches:
-                    llm_result[key] = kpp_matches.pop(0) if "заказчика" in key else kpp_matches.pop(0) if kpp_matches else ""
+                    normalized_result[key] = kpp_matches.pop(0) if "заказчика" in key else kpp_matches.pop(0) if kpp_matches else ""
         
         # Очистка номера документа
-        doc_number = llm_result.get("Номер документа", "")
+        doc_number = normalized_result.get("Номер_документа", "")
         if doc_number:
             clean_number = re.sub(r'\s*от\s*\d+.*', '', doc_number)
             clean_number = re.sub(r'\s*\d{1,2}[./]\d{1,2}[./]\d{2,4}.*', '', clean_number)
-            llm_result["Номер документа"] = clean_number.strip()
+            normalized_result["Номер_документа"] = clean_number.strip()
         
-        # Проверка типа документа
-        doc_type = llm_result.get("Тип документа", "")
-        valid_types = ["Акт", "Счёт", "Счет-фактура", "Договор"]
+        # Проверка и нормализация типа документа в нижнем регистре
+        doc_type = normalized_result.get("Тип_документа", "").lower()
+        valid_types = ["договор", "акт", "счет", "счет-фактура"]
+        
         if doc_type not in valid_types:
             text_lower = original_text.lower()
             if "счет-фактура" in text_lower:
-                llm_result["Тип документа"] = "Счет-фактура"
+                normalized_result["Тип_документа"] = "счет-фактура"
             elif "акт" in text_lower:
-                llm_result["Тип документа"] = "Акт"
+                normalized_result["Тип_документа"] = "акт"
             elif "счет" in text_lower:
-                llm_result["Тип документа"] = "Счёт"
+                normalized_result["Тип_документа"] = "счет"
             elif "договор" in text_lower:
-                llm_result["Тип документа"] = "Договор"
+                normalized_result["Тип_документа"] = "договор"
             else:
-                llm_result["Тип документа"] = "Неопределен"
-        
-        return llm_result
+                normalized_result["Тип_документа"] = "неопределен"
+        else:
+            # Убеждаемся, что тип документа в нижнем регистре
+            normalized_result["Тип_документа"] = doc_type.lower()
+            
+        return normalized_result
         
     except Exception as e:
+        print(f"Ошибка валидации: {e}")
         return llm_result
 
 
@@ -598,6 +791,12 @@ class SuryaSimpleGUI:
         self.total_processing_time = 0
         self.total_doc_count = 0
         
+        # Счетчики типов документов
+        self.acts_count = 0
+        self.invoices_count = 0
+        self.bills_count = 0
+        self.contracts_count = 0
+        
         self.setup_ui()
         
     def setup_ui(self):
@@ -633,12 +832,12 @@ class SuryaSimpleGUI:
         perf_frame.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=5)
         
         ttk.Label(perf_frame, text="OCR потоков:").pack(side=tk.LEFT)
-        self.ocr_threads_var = tk.StringVar(value="2")
+        self.ocr_threads_var = tk.StringVar(value="1")
         self.ocr_threads_spinbox = ttk.Spinbox(perf_frame, from_=1, to=8, width=5, textvariable=self.ocr_threads_var)
         self.ocr_threads_spinbox.pack(side=tk.LEFT, padx=(5, 20))
         
         ttk.Label(perf_frame, text="LLM потоков:").pack(side=tk.LEFT)
-        self.llm_threads_var = tk.StringVar(value="2")
+        self.llm_threads_var = tk.StringVar(value="1")
         self.llm_threads_spinbox = ttk.Spinbox(perf_frame, from_=1, to=4, width=5, textvariable=self.llm_threads_var)
         self.llm_threads_spinbox.pack(side=tk.LEFT, padx=5)
         row += 1
@@ -745,7 +944,7 @@ class SuryaSimpleGUI:
         
         # Третья колонка - Общая статистика
         total_stats_frame = ttk.Frame(stats_frame)
-        total_stats_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        total_stats_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
         ttk.Label(total_stats_frame, text="Общая статистика:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
         self.total_avg_time_label = ttk.Label(total_stats_frame, text="Среднее на док.: 0 сек")
         self.total_avg_time_label.pack(anchor=tk.W)
@@ -753,6 +952,19 @@ class SuryaSimpleGUI:
         self.total_time_breakdown_label.pack(anchor=tk.W)
         self.processing_speed_label = ttk.Label(total_stats_frame, text="Скорость: 0 док/мин")
         self.processing_speed_label.pack(anchor=tk.W)
+        
+        # Четвертая колонка - Типы документов
+        doc_types_frame = ttk.Frame(stats_frame)
+        doc_types_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        ttk.Label(doc_types_frame, text="Типы документов:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        self.acts_count_label = ttk.Label(doc_types_frame, text="Акты: 0")
+        self.acts_count_label.pack(anchor=tk.W)
+        self.invoices_count_label = ttk.Label(doc_types_frame, text="Счета: 0")
+        self.invoices_count_label.pack(anchor=tk.W)
+        self.bills_count_label = ttk.Label(doc_types_frame, text="Счет-фактуры: 0")
+        self.bills_count_label.pack(anchor=tk.W)
+        self.contracts_count_label = ttk.Label(doc_types_frame, text="Договоры: 0")
+        self.contracts_count_label.pack(anchor=tk.W)
         
         row += 1
         
@@ -895,6 +1107,29 @@ class SuryaSimpleGUI:
         # Обновляем общую статистику
         self.update_total_stats()
     
+    def update_document_type_count(self, doc_type):
+        """Обновление счетчиков типов документов"""
+        # Увеличиваем счетчик только если тип не пустой
+        if doc_type:
+            # Приводим к нижнему регистру для сравнения
+            doc_type_lower = doc_type.lower()
+            
+            if doc_type_lower == "акт":
+                self.acts_count += 1
+            elif doc_type_lower in ["счёт", "счет"]:
+                self.invoices_count += 1
+            elif doc_type_lower == "счет-фактура":
+                self.bills_count += 1
+            elif doc_type_lower == "договор":
+                self.contracts_count += 1
+        
+        # Обновляем GUI
+        self.acts_count_label.config(text=f"Акты: {self.acts_count}")
+        self.invoices_count_label.config(text=f"Счета: {self.invoices_count}")
+        self.bills_count_label.config(text=f"Счет-фактуры: {self.bills_count}")
+        self.contracts_count_label.config(text=f"Договоры: {self.contracts_count}")
+        self.root.update_idletasks()
+    
     def update_total_stats(self):
         """Обновление общей статистики (OCR + LLM)"""
         if self.ocr_doc_count > 0 and self.llm_doc_count > 0:
@@ -964,23 +1199,32 @@ class SuryaSimpleGUI:
             return None, None
             
     def prepare_truncated_ocr_for_llm(self, ocr_json_data):
-        """Усечение: первые 10 с первой + последние 30 с последней"""
+        """Умное усечение OCR данных для LLM с точным подсчетом токенов"""
         pages_data = ocr_json_data.get("pages_data", [])
         total_pages = len(pages_data)
         
         if total_pages == 0:
             return []
         
-        truncated_lines = []
+        # Собираем все строки со всех страниц
+        all_lines = []
+        for page_idx, page in enumerate(pages_data):
+            for line in page["text_lines"]:
+                all_lines.append({
+                    "page": page_idx + 1,
+                    "text": line["text"],
+                    "bbox": line["bbox"],
+                    "confidence": line["confidence"]
+                })
         
-        # Первая страница: первые 10 строк
-        first_page_lines = pages_data[0]["text_lines"]
-        truncated_lines.extend([{"source": "first_page", **line} for line in first_page_lines[:self.first_page_lines]])
+        # Используем новую логику усечения с точным подсчетом токенов
+        max_tokens = 12000  # Оставляем место для промпта (4000 токенов)
+        truncated_lines, token_count, was_truncated = smart_truncate_for_llm(all_lines, max_tokens)
         
-        # Последняя страница: последние 30 строк
-        last_page_lines = pages_data[-1]["text_lines"]
-        start_idx = max(0, len(last_page_lines) - self.last_page_lines)
-        truncated_lines.extend([{"source": "last_page", **line} for line in last_page_lines[start_idx:]])
+        if was_truncated:
+            self.log(f"✂️ Документ усечен: {token_count} токенов")
+        else:
+            self.log(f"✅ Документ помещается: {token_count} токенов")
         
         return truncated_lines
         
@@ -1196,6 +1440,13 @@ class SuryaSimpleGUI:
             self.llm_completed_count = 0
             self.llm_doc_times = []
             
+            # Сбрасываем счетчики типов документов
+            self.acts_count = 0
+            self.invoices_count = 0
+            self.bills_count = 0
+            self.contracts_count = 0
+            self.update_document_type_count("")  # Обновляем GUI
+            
             os.makedirs(json_folder, exist_ok=True)
             
             pdf_files = [f for f in os.listdir(pdf_folder) if f.lower().endswith('.pdf')]
@@ -1383,6 +1634,15 @@ class SuryaSimpleGUI:
                             try:
                                 time_part = result.split("(время: ")[1].split("с)")[0]
                                 doc_time = float(time_part)
+                            except:
+                                pass
+                        
+                        # Парсим тип документа для статистики
+                        if "Завершено" in result and " - " in result:
+                            try:
+                                doc_type = result.split(" - ")[-1].strip()
+                                if doc_type and doc_type != "Неопределен":
+                                    self.update_document_type_count(doc_type)
                             except:
                                 pass
                         

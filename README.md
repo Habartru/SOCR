@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![SuperOCR Logo](https://img.shields.io/badge/SuperOCR-v2.0-blue?style=for-the-badge)
+![SuperOCR Logo](https://img.shields.io/badge/SuperOCR-v2.1-blue?style=for-the-badge)
 ![Python](https://img.shields.io/badge/Python-3.10+-green?style=for-the-badge&logo=python)
 ![CUDA](https://img.shields.io/badge/CUDA-11.8+-orange?style=for-the-badge&logo=nvidia)
 ![License](https://img.shields.io/badge/License-MIT-red?style=for-the-badge)
@@ -225,6 +225,15 @@ docker-compose up -d
 ## 📖 Документация
 
 Подробная техническая документация доступна в файле [PROJECT_ARCHITECTURE.md](PROJECT_ARCHITECTURE.md)
+
+История изменений и улучшений: [CHANGELOG.md](Docs/CHANGELOG.md)
+
+### 🆕 Последние улучшения (v2.1)
+
+- ✅ **Улучшенное логирование** - исправлен вывод "Неопределен" в логах
+- ✅ **Нормализация ключей JSON** - унифицированный формат с подчеркиванием
+- ✅ **Улучшенная валидация данных** - более точная обработка ИНН и КПП
+- ✅ **Агрессивное восстановление JSON** - предотвращение ошибок при разборе ответов LLM
 
 ## 🆘 Поддержка
 
