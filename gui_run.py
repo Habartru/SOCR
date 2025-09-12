@@ -1,49 +1,338 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Простой GUI для массовой обработки документов с Surya OCR
-Только необходимый функционал по требованиям пользователя
-
-ПОДДЕРЖКА МОДЕЛЕЙ:
-- Работает с любой моделью, загруженной в LM Studio
-- Автоматически адаптируется к контексту модели
-- Универсальный API через local-model идентификатор
-
-Добавлена поддержка усечения OCR данных для LLM: только первые 10 строк с первой страницы (фокус на заголовках/реквизитах) и последние 30 строк с последней страницы (фокус на подписях/итогах).
-Это оптимизирует токены для LLM (Phi-4 с 16k контекстом) и сохраняет точность ~99% для российских деловых документов.
-
-Оптимизации скорости:
-- Параллельная обработка PDF: Используем multiprocessing.Pool для запуска нескольких процессов (2, как указано).
-- Surya OCR: Batch processing по умолчанию, но в многопроцессности каждый PDF в отдельном процессе.
-- LLM: Поддержка нескольких инстансов моделей в LM Studio на одном порту (local-1 и local-2). Балансировка запросов через round-robin по именам моделей.
+SuperOCR - Advanced OCR Application with Surya OCR 0.16.7 + CUDA
+Optimized for maximum speed and GPU utilization
 """
+
+import os
+import sys
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-import os
-import json
-import csv
-import time
-import threading
-from datetime import datetime
 from pathlib import Path
-import requests
-import multiprocessing  # Для параллельной обработки
-from multiprocessing import Process, Queue
+import threading
+import json
+import platform
 import queue
+import csv  # Добавляем импорт модуля csv
+from datetime import datetime
+from multiprocessing import Process, Queue
 
-# Импорты Surya
-from surya.input.load import load_from_file
-from surya.detection import DetectionPredictor
-from surya.recognition import RecognitionPredictor
-from surya.common.surya.schema import TaskNames
+# Add the project root to Python path
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
+
+# Set environment variables BEFORE any other imports
+os.environ['RECOGNITION_BATCH_SIZE'] = '64'
+os.environ['DETECTOR_BATCH_SIZE'] = '16'
+os.environ['TORCH_DEVICE'] = 'cuda'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+# Try to import pydantic, install if missing
+def ensure_pydantic():
+    """Ensure pydantic is available, install if missing"""
+    try:
+        import pydantic
+        print(f"✅ Pydantic version: {pydantic.__version__}")
+        return True
+    except ImportError:
+        print("⚠️ Pydantic not found, attempting to install...")
+        try:
+            import subprocess
+            import sys
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", 
+                "pydantic==2.11.7", "pydantic-settings==2.10.1"
+            ])
+            import pydantic
+            print(f"✅ Pydantic installed and imported, version: {pydantic.__version__}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to install pydantic: {e}")
+            print("⚠️ Application may not work correctly without pydantic")
+            return False
+
+# Ensure pydantic is available
+pydantic_available = ensure_pydantic()
+
+# Check CUDA availability
+try:
+    import torch
+    if torch.cuda.is_available():
+        print(f"🚀 GPU Settings Applied: {torch.cuda.get_device_name(0)}")
+        print(f"🚀 RECOGNITION_BATCH_SIZE={os.environ.get('RECOGNITION_BATCH_SIZE', '64')}")
+        print(f"🚀 DETECTOR_BATCH_SIZE={os.environ.get('DETECTOR_BATCH_SIZE', '16')}")
+        print(f"🚀 TORCH_DEVICE={os.environ.get('TORCH_DEVICE', 'cuda')}")
+    else:
+        print("⚠️ CUDA not available, but forcing GPU mode...")
+except Exception as e:
+    print(f"⚠️ Error checking CUDA availability: {e}")
+    print("⚠️ Forcing GPU mode...")
+
+# Дополнительные оптимизации
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+# Импорты Surya with error handling
+SURYA_AVAILABLE = False
+try:
+    if pydantic_available:
+        from surya.input.load import load_from_file
+        from surya.detection import DetectionPredictor
+        from surya.recognition import RecognitionPredictor
+        from surya.foundation import FoundationPredictor
+        from surya.common.surya.schema import TaskNames
+        SURYA_AVAILABLE = True
+        print("✅ Surya OCR imports successful")
+    else:
+        print("❌ Skipping Surya OCR imports due to missing pydantic")
+except ImportError as e:
+    print(f"❌ Failed to import Surya OCR: {e}")
+    SURYA_AVAILABLE = False
+except Exception as e:
+    print(f"❌ Unexpected error importing Surya OCR: {e}")
+    SURYA_AVAILABLE = False
+
+# Подавляем предупреждения torch_dtype deprecated
+import warnings
+warnings.filterwarnings("ignore", message=".*torch_dtype.* is deprecated.*")
 
 # Импорт для подсчета токенов
-from token_counter import smart_truncate_for_llm, check_context_limit
+try:
+    from token_counter import smart_truncate_for_llm, check_context_limit
+    print("✅ Token counter imports successful")
+except ImportError as e:
+    print(f"❌ Failed to import token_counter: {e}")
+    # Create dummy functions to avoid crashes
+    def smart_truncate_for_llm(*args, **kwargs):
+        return [], 0, False
+    
+    def check_context_limit(*args, **kwargs):
+        return False, 0
+
+def handle_surya_error_optimized(pdf_path, det_predictor, rec_predictor, max_retries=2):
+    """
+    ОПТИМИЗИРОВАННАЯ обработка ошибок Surya OCR - БЕЗ пересоздания предикторов!
+    Используем ГОТОВЫЕ предикторы для максимальной скорости
+    """
+    import torch
+    
+    filename = os.path.basename(pdf_path)
+    
+    # Обычные повторы (меньше попыток)
+    for attempt in range(max_retries + 1):
+        try:
+            images, names = load_from_file(pdf_path)
+            task_names = [TaskNames.ocr_with_boxes] * len(images)
+            predictions = rec_predictor(
+                images,
+                task_names=task_names,
+                det_predictor=det_predictor,
+                math_mode=False
+            )
+            
+            if attempt > 0:
+                print(f"✅ Surya ошибка устранена для {filename} на попытке {attempt + 1}")
+            
+            return predictions  # Успешно
+            
+        except Exception as ocr_error:
+            error_msg = str(ocr_error)
+            
+            # Легкая очистка GPU кэша (без пересоздания предикторов)
+            if attempt < max_retries:
+                print(f"⚠️ Surya ошибка для {filename} (попытка {attempt + 1}/{max_retries + 1}): {error_msg}")
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Короткая пауза
+                time.sleep(0.5)
+                continue
+            else:
+                # Окончательная ошибка
+                print(f"❌ Не удалось обработать {filename} после {max_retries + 1} попыток: {error_msg}")
+                raise ocr_error
+
+# Глобальный кеш предикторов для ускорения (критическая оптимизация)
+_GLOBAL_PREDICTORS_CACHE = {
+    'det_predictor': None,
+    'foundation_predictor': None, 
+    'rec_predictor': None,
+    'initialized': False
+}
+
+def get_cached_predictors():
+    """
+    Получение кешированных предикторов Surya OCR
+    КРИТИЧЕСКАЯ ОПТИМИЗАЦИЯ: создаем предикторы только один раз для всего приложения
+    """
+    global _GLOBAL_PREDICTORS_CACHE
+    
+    if not _GLOBAL_PREDICTORS_CACHE['initialized']:
+        print("🚀 Инициализация Surya OCR предикторов (один раз)...")
+        import time
+        start_time = time.time()
+        
+        _GLOBAL_PREDICTORS_CACHE['det_predictor'] = DetectionPredictor()
+        print(f"   ✅ DetectionPredictor: {time.time() - start_time:.1f}с")
+        
+        foundation_start = time.time()
+        _GLOBAL_PREDICTORS_CACHE['foundation_predictor'] = FoundationPredictor()
+        print(f"   ✅ FoundationPredictor: {time.time() - foundation_start:.1f}с")
+        
+        rec_start = time.time()
+        _GLOBAL_PREDICTORS_CACHE['rec_predictor'] = RecognitionPredictor(_GLOBAL_PREDICTORS_CACHE['foundation_predictor'])
+        print(f"   ✅ RecognitionPredictor: {time.time() - rec_start:.1f}с")
+        
+        _GLOBAL_PREDICTORS_CACHE['initialized'] = True
+        print(f"🎯 Инициализация завершена за {time.time() - start_time:.1f}с")
+    
+    return (
+        _GLOBAL_PREDICTORS_CACHE['det_predictor'],
+        _GLOBAL_PREDICTORS_CACHE['rec_predictor']
+    )
+
+def handle_surya_error_and_retry(pdf_path, det_predictor, rec_predictor, max_retries=3):
+    """
+    Обработка ошибок Surya OCR с повторными попытками + Fallback по страницам
+    Решает проблемы с '_seen_tokens' и 'ContinuousBatchingCache'
+    """
+    import torch
+    
+    filename = os.path.basename(pdf_path)
+    
+    # ЭТАП 1: Обычные повторы
+    for attempt in range(max_retries + 1):
+        try:
+            images, names = load_from_file(pdf_path)
+            task_names = [TaskNames.ocr_with_boxes] * len(images)
+            predictions = rec_predictor(
+                images,
+                task_names=task_names,
+                det_predictor=det_predictor,
+                math_mode=False
+            )
+            
+            # Образуем лог о результате
+            if attempt > 0:
+                print(f"✅ Surya ошибка устранена для {filename} на попытке {attempt + 1}")
+            
+            return predictions  # Успешно
+            
+        except Exception as ocr_error:
+            error_msg = str(ocr_error)
+            
+            # Проверяем специфичные ошибки Surya
+            if ("_seen_tokens" in error_msg or 
+                "ContinuousBatchingCache" in error_msg or
+                "AttributeError" in error_msg) and attempt < max_retries:
+                
+                print(f"⚠️ Surya ошибка для {filename} (попытка {attempt + 1}/{max_retries + 1}): {error_msg}")
+                
+                # Очистка GPU кэша
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Пересоздаем предикторы
+                det_predictor = DetectionPredictor()
+                foundation_predictor = FoundationPredictor()
+                rec_predictor = RecognitionPredictor(foundation_predictor)
+                
+                # Пауза перед повтором (увеличиваем с каждой попыткой)
+                pause_time = 1 + attempt * 0.5
+                time.sleep(pause_time)
+                continue
+                
+            else:
+                # Не наша ошибка или исчерпаны попытки
+                if attempt >= max_retries:
+                    # ЭТАП 2: FALLBACK - попробуем обработать по страницам
+                    print(f"🔄 Fallback для {filename}: попытка обработки по страницам...")
+                    try:
+                        return process_pdf_page_by_page(pdf_path, det_predictor, rec_predictor)
+                    except Exception as fallback_error:
+                        print(f"❌ Fallback тоже неудачен для {filename}: {str(fallback_error)}")
+                        print(f"❌ Surya ошибка для {filename}: исчерпаны все методы - {error_msg}")
+                raise ocr_error
+    
+    raise Exception(f"Не удалось обработать {filename} после {max_retries + 1} попыток")
+
+
+def process_pdf_page_by_page(pdf_path, det_predictor, rec_predictor):
+    """
+    Fallback-метод: обработка PDF по одной странице для проблемных документов
+    """
+    import torch
+    
+    filename = os.path.basename(pdf_path)
+    images, names = load_from_file(pdf_path)
+    
+    print(f"📄 Обрабатываем {filename} по страницам ({len(images)} страниц)...")
+    
+    all_predictions = []
+    
+    for page_idx, image in enumerate(images):
+        page_attempts = 0
+        max_page_attempts = 2
+        
+        while page_attempts <= max_page_attempts:
+            try:
+                # Очищаем кэш перед каждой страницей
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Обрабатываем одну страницу
+                task_names = [TaskNames.ocr_with_boxes]
+                page_predictions = rec_predictor(
+                    [image],  # Одна страница
+                    task_names=task_names,
+                    det_predictor=det_predictor,
+                    math_mode=False
+                )
+                
+                all_predictions.extend(page_predictions)
+                print(f"✅ Страница {page_idx + 1}/{len(images)} обработана")
+                break  # Успешно
+                
+            except Exception as page_error:
+                page_attempts += 1
+                if "_seen_tokens" in str(page_error) or "ContinuousBatchingCache" in str(page_error):
+                    if page_attempts <= max_page_attempts:
+                        print(f"⚠️ Ошибка на странице {page_idx + 1} (попытка {page_attempts}/{max_page_attempts + 1})")
+                        
+                        # Пересоздаем предикторы для страницы
+                        det_predictor = DetectionPredictor()
+                        foundation_predictor = FoundationPredictor()
+                        rec_predictor = RecognitionPredictor(foundation_predictor)
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        print(f"❌ Пропускаем страницу {page_idx + 1}: {str(page_error)}")
+                        # Создаем пустой результат для пропущенной страницы
+                        # Создаем минимальный объект с пустыми строками
+                        class EmptyResult:
+                            def __init__(self):
+                                self.text_lines = []
+                                self.languages = []
+                                self.image_bbox = [0, 0, 100, 100]
+                        
+                        all_predictions.append(EmptyResult())
+                        break
+                else:
+                    raise page_error  # Неизвестная ошибка
+    
+    print(f"🎯 Fallback завершен для {filename}: {len(all_predictions)} страниц")
+    return all_predictions
 
 
 def ocr_worker(pdf_queue, ocr_queue, pdf_folder, date_format):
     """OCR воркер: непрерывно обрабатывает PDF и подает в OCR очередь"""
     det_predictor = DetectionPredictor()
-    rec_predictor = RecognitionPredictor()
+    foundation_predictor = FoundationPredictor()
+    rec_predictor = RecognitionPredictor(foundation_predictor)
     
     while True:
         try:
@@ -95,7 +384,7 @@ def ocr_worker(pdf_queue, ocr_queue, pdf_folder, date_format):
         except queue.Empty:
             continue
         except Exception as e:
-            ocr_queue.put((pdf_file, None, f"OCR ошибка: {e}"))
+            ocr_queue.put(("unknown_file", None, f"OCR ошибка: {e}"))
 
 def llm_worker(ocr_queue, result_queue, json_folder, llm_settings, model_name, worker_name=None, retry_queue=None):
     """ЛЛМ воркер: непрерывно обрабатывает OCR данные"""
@@ -159,12 +448,13 @@ def llm_worker(ocr_queue, result_queue, json_folder, llm_settings, model_name, w
         except queue.Empty:
             continue
         except Exception as e:
-            result_queue.put(f"Ошибка [{display_name}] {pdf_file}: {e}")
+            result_queue.put(f"Ошибка [{display_name}] unknown: {e}")
 
 def ocr_worker_simple(pdf_queue, result_queue):
-    """Простой OCR воркер для неблокирующей обработки"""
-    det_predictor = DetectionPredictor()
-    rec_predictor = RecognitionPredictor()
+    """Простой OCR воркер для неблокирующей обработки - МАКСИМАЛЬНО ОПТИМИЗИРОВАННАЯ ВЕРСИЯ"""
+    # КРИТИЧЕСКОЕ УЛУЧШЕНИЕ: Используем глобальный кеш!
+    det_predictor, rec_predictor = get_cached_predictors()
+    print("✅ Surya OCR воркер готов (используем кеш)")
     
     while True:
         try:
@@ -173,7 +463,8 @@ def ocr_worker_simple(pdf_queue, result_queue):
                 break
                 
             pdf_file, pdf_folder, date_format = item
-            result = ocr_single_file_worker(pdf_file, pdf_folder, date_format)
+            # Передаем предикторы в функцию (не создаем новые!)
+            result = ocr_single_file_worker_optimized(pdf_file, pdf_folder, date_format, det_predictor, rec_predictor)
             result_queue.put(result)
             
         except queue.Empty:
@@ -185,27 +476,29 @@ def ocr_worker_simple(pdf_queue, result_queue):
                 "error": str(e)
             })
 
-def ocr_single_file_worker(pdf_file, pdf_folder, date_format):
-    """Обработка одного PDF файла через Surya OCR (вне класса)"""
+def ocr_single_file_worker_optimized(pdf_file, pdf_folder, date_format, det_predictor, rec_predictor):
+    """ОПТИМИЗИРОВАННАЯ обработка одного PDF файла - ИСПОЛЬЗУЕМ ГОТОВЫЕ ПРЕДИКТОРЫ"""
     start_time = time.time()
     try:
-        # Инициализация Surya в каждом процессе
-        det_predictor = DetectionPredictor()
-        rec_predictor = RecognitionPredictor()
+        # Очистка GPU кэша (легкая операция)
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         pdf_path = os.path.join(pdf_folder, pdf_file)
         
-        # OCR обработка
-        images, names = load_from_file(pdf_path)
-        task_names = [TaskNames.ocr_with_boxes] * len(images)
-        predictions = rec_predictor(
-            images,
-            task_names=task_names,
-            det_predictor=det_predictor,
-            math_mode=False
-        )
+        # OCR обработка с улучшенной обработкой ошибок Surya (БЕЗ пересоздания!)
+        try:
+            predictions = handle_surya_error_optimized(pdf_path, det_predictor, rec_predictor, max_retries=2)  # Меньше повторов
+            
+            # Проверяем, что predictions получены корректно
+            if predictions is None:
+                raise Exception("OCR вернул пустой результат")
+                
+        except Exception as ocr_error:
+            raise ocr_error
         
-        # Формирование данных
+        # Остальное остается так же...
         pages_data = []
         combined_text = ""
         
@@ -241,18 +534,15 @@ def ocr_single_file_worker(pdf_file, pdf_folder, date_format):
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(['filename', 'recognition_date', 'ocr_json', 'ocr_text'])
-            
             date_str = datetime.now().strftime("%Y-%m-%d" if date_format == "ISO" else "%d.%m.%Y")
             writer.writerow([pdf_file, date_str, json.dumps(ocr_json, ensure_ascii=False), combined_text.strip()])
         
-        # Подготовка данных для LLM с умным усечением
+        # Смарт-усечение для LLM (оптимизированное)
         all_lines = []
         for page_data in pages_data:
-            all_lines.extend(page_data["text_lines"])
+            all_lines.extend([{"page": page_data["page"], **line} for line in page_data["text_lines"]])
         
-        # Применяем умное усечение с точным подсчетом токенов
-        max_tokens = 12000  # Оставляем место для промпта (4000 токенов)
-        truncated_lines, token_count, was_truncated = smart_truncate_for_llm(all_lines, max_tokens)
+        truncated_lines, was_truncated, token_count = smart_truncate_for_llm(all_lines, max_tokens=15000)
         
         if was_truncated:
             print(f"✂️ Документ {pdf_file} усечен: {token_count} токенов")
@@ -277,6 +567,11 @@ def ocr_single_file_worker(pdf_file, pdf_folder, date_format):
             "processing_time": processing_time
         }
 
+# УСТАРЕВШАЯ ФУНКЦИЯ УДАЛЕНА - использовала неоптимизированное создание предикторов
+# Заменена на ocr_single_file_worker_optimized() который использует готовые предикторы
+# Эта функция создавала DetectionPredictor, FoundationPredictor, RecognitionPredictor для каждого документа
+# что занимало 2+ секунды на инициализацию вместо использования глобального кеша
+
 def process_single_file_worker(args):
     """Функция-воркер для multiprocessing (вне класса для избежания pickle ошибок)"""
     pdf_file, pdf_folder, json_folder, date_format, llm_settings = args
@@ -284,7 +579,8 @@ def process_single_file_worker(args):
     try:
         # Инициализация Surya в каждом процессе
         det_predictor = DetectionPredictor()
-        rec_predictor = RecognitionPredictor()
+        foundation_predictor = FoundationPredictor()
+        rec_predictor = RecognitionPredictor(foundation_predictor)
         
         pdf_path = os.path.join(pdf_folder, pdf_file)
         
@@ -344,7 +640,7 @@ def process_single_file_worker(args):
             all_lines.extend(page_data["text_lines"])
         
         # Проверяем размер и применяем умное усечение
-        max_tokens = 12000  # Оставляем 4000 токенов для промпта
+        max_tokens = 15000  # Оставляем 1500 токенов для промпта
         truncated_lines, token_count, was_truncated = smart_truncate_for_llm(all_lines, max_tokens)
         
         if was_truncated:
@@ -408,6 +704,7 @@ def generate_llm_prompt(filename, truncated_data, structured_data):
 - ИНН: только числа длиной 10 цифр (юрлица) или 12 цифр (ИП/физлица)
 - КПП: только 9 цифр (только для юрлиц!)
 - Адрес: полный юридический адрес без названия организации
+- Дата документа: ОБЯЗАТЕЛЬНО приведи к формату ДД.ММ.ГГГГ (например: 17.02.2023), независимо от исходного формата в документе
 
 ПРИМЕРЫ ОПРЕДЕЛЕНИЯ РОЛЕЙ:
 - В договоре купли-продажи автомобиля: Продавец = ИСПОЛНИТЕЛЬ, Покупатель = ЗАКАЗЧИК
@@ -464,25 +761,44 @@ def analyze_with_llm_worker(filename, truncated_data, llm_settings, model_name):
     return analyze_document(filename, truncated_data, llm_settings, model_name)
 
 
+# ОПТИМИЗИРОВАННЫЙ HTTP КЛИЕНТ ДЛЯ LLM
+# Кеширование HTTP сессий для повышения производительности
+_HTTP_SESSIONS_CACHE = {}
+
+def get_http_session(endpoint):
+    """Получение кешированной HTTP сессии для повторного использования соединений"""
+    global _HTTP_SESSIONS_CACHE
+    
+    if endpoint not in _HTTP_SESSIONS_CACHE:
+        import requests
+        from requests.adapters import HTTPAdapter
+        session = requests.Session()
+        # Оптимизация connection pooling
+        session.mount('http://', HTTPAdapter(
+            pool_connections=2, pool_maxsize=5, max_retries=1))
+        session.mount('https://', HTTPAdapter(
+            pool_connections=2, pool_maxsize=5, max_retries=1))
+        _HTTP_SESSIONS_CACHE[endpoint] = session
+        print(f"🔗 Создана HTTP сессия для {endpoint}")
+    
+    return _HTTP_SESSIONS_CACHE[endpoint]
+
 def send_to_llm(prompt, llm_settings, model_name):
-    """Отправка промпта в LLM и надежная обработка JSON-ответов"""
+    """ОПТИМИЗИРОВАННАЯ отправка промпта в LLM с кешированием HTTP сессий"""
     try:
         # Поддержка OpenAI и LM Studio
         provider = llm_settings.get('provider', 'LM Studio')
         
         if provider == 'OpenAI':
-            # Настройки для OpenAI
             api_key = llm_settings.get('api_key', '')
             if not api_key:
                 return {"error": "Не указан OpenAI API ключ"}
-                
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}"
             }
             endpoint = "https://api.openai.com/v1/chat/completions"
         else:
-            # Настройки для LM Studio
             headers = {"Content-Type": "application/json"}
             endpoint = f"{llm_settings.get('endpoint', 'http://localhost:1234')}/v1/chat/completions"
         
@@ -493,8 +809,11 @@ def send_to_llm(prompt, llm_settings, model_name):
             "max_tokens": llm_settings.get('max_tokens', 16000)
         }
         
+        # Используем кешированную HTTP сессию для ускорения
+        session = get_http_session(endpoint)
+        
         try:
-            response = requests.post(
+            response = session.post(
                 endpoint, headers=headers, json=data, 
                 timeout=llm_settings.get('timeout', 180)
             )
@@ -749,6 +1068,11 @@ class SuryaSimpleGUI:
         self.json_folder = tk.StringVar()
         self.date_format = tk.StringVar(value="ISO")
         
+        # Новые переменные для расширенного выбора файлов
+        self.selected_files = []  # Список выбранных отдельных файлов
+        self.recursive_search = tk.BooleanVar(value=False)  # Рекурсивный поиск в подпапках
+        self.file_selection_mode = tk.StringVar(value="folder")  # "folder" или "files"
+        
         self.processing = False
         self.total_files = 0
         self.processed_files = 0
@@ -768,6 +1092,7 @@ class SuryaSimpleGUI:
         
         # Предикторы Surya (будут инициализированы в процессах)
         self.det_predictor = None
+        self.foundation_predictor = None
         self.rec_predictor = None
         
         # Оптимизация: Число параллельных процессов (будет переопределено из GUI)
@@ -806,22 +1131,63 @@ class SuryaSimpleGUI:
         
         row = 0
         
-        # Выбор папки с PDF-файлами
-        ttk.Label(main_frame, text="Папка с PDF-файлами:").grid(row=row, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(main_frame, textvariable=self.pdf_folder, width=50).grid(row=row, column=1, sticky=(tk.W, tk.E), padx=5)
-        ttk.Button(main_frame, text="Обзор", command=self.select_pdf_folder).grid(row=row, column=2, padx=5)
+        # Выбор режима выбора файлов
+        ttk.Label(main_frame, text="Режим выбора файлов:").grid(row=row, column=0, sticky=tk.W, pady=5)
+        mode_frame = ttk.Frame(main_frame)
+        mode_frame.grid(row=row, column=1, sticky="ew", padx=5)
+        
+        ttk.Radiobutton(mode_frame, text="Папка с файлами", 
+                       variable=self.file_selection_mode, value="folder",
+                       command=self.on_mode_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_frame, text="Отдельные файлы", 
+                       variable=self.file_selection_mode, value="files",
+                       command=self.on_mode_change).pack(side=tk.LEFT, padx=(20, 0))
+        row += 1
+        
+        # Выбор папки с PDF-файлами (для режима папки)
+        self.folder_label = ttk.Label(main_frame, text="Папка с PDF-файлами:")
+        self.folder_label.grid(row=row, column=0, sticky=tk.W, pady=5)
+        self.folder_entry = ttk.Entry(main_frame, textvariable=self.pdf_folder, width=50)
+        self.folder_entry.grid(row=row, column=1, sticky="ew", padx=5)
+        self.folder_button = ttk.Button(main_frame, text="Обзор", command=self.select_pdf_folder)
+        self.folder_button.grid(row=row, column=2, padx=5)
+        row += 1
+        
+        # Опция рекурсивного поиска (для режима папки)
+        self.recursive_frame = ttk.Frame(main_frame)
+        self.recursive_frame.grid(row=row, column=1, sticky="ew", padx=5)
+        self.recursive_checkbox = ttk.Checkbutton(
+            self.recursive_frame,
+            text="Искать в подпапках (рекурсивно)",
+            variable=self.recursive_search
+        )
+        self.recursive_checkbox.pack(side=tk.LEFT)
+        row += 1
+        
+        # Выбор отдельных файлов (для режима файлов)
+        self.files_label = ttk.Label(main_frame, text="Выбранные файлы:")
+        self.files_label.grid(row=row, column=0, sticky=tk.W, pady=5)
+        
+        files_button_frame = ttk.Frame(main_frame)
+        files_button_frame.grid(row=row, column=1, sticky="ew", padx=5)
+        self.select_files_button = ttk.Button(files_button_frame, text="Выбрать файлы", command=self.select_pdf_files)
+        self.select_files_button.pack(side=tk.LEFT)
+        self.clear_files_button = ttk.Button(files_button_frame, text="Очистить", command=self.clear_selected_files)
+        self.clear_files_button.pack(side=tk.LEFT, padx=(10, 0))
+        self.files_count_label = ttk.Label(files_button_frame, text="Файлов: 0")
+        self.files_count_label.pack(side=tk.LEFT, padx=(10, 0))
         row += 1
         
         # Выбор папки для JSON-файлов
         ttk.Label(main_frame, text="Папка для JSON файлов:").grid(row=row, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(main_frame, textvariable=self.json_folder, width=50).grid(row=row, column=1, sticky=(tk.W, tk.E), padx=5)
+        ttk.Entry(main_frame, textvariable=self.json_folder, width=50).grid(row=row, column=1, sticky="ew", padx=5)
         ttk.Button(main_frame, text="Обзор", command=self.select_json_folder).grid(row=row, column=2, padx=5)
         row += 1
         
         # Настройка формата даты
         ttk.Label(main_frame, text="Формат даты:").grid(row=row, column=0, sticky=tk.W, pady=5)
         date_frame = ttk.Frame(main_frame)
-        date_frame.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=5)
+        date_frame.grid(row=row, column=1, sticky="ew", padx=5)
         ttk.Radiobutton(date_frame, text="ISO 8601 (2023-02-17)", variable=self.date_format, value="ISO").pack(side=tk.LEFT)
         ttk.Radiobutton(date_frame, text="Классический (17.02.2023)", variable=self.date_format, value="CLASSIC").pack(side=tk.LEFT, padx=10)
         row += 1
@@ -829,7 +1195,7 @@ class SuryaSimpleGUI:
         # Настройки производительности
         ttk.Label(main_frame, text="Настройки потоков:").grid(row=row, column=0, sticky=tk.W, pady=5)
         perf_frame = ttk.Frame(main_frame)
-        perf_frame.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=5)
+        perf_frame.grid(row=row, column=1, sticky="ew", padx=5)
         
         ttk.Label(perf_frame, text="OCR потоков:").pack(side=tk.LEFT)
         self.ocr_threads_var = tk.StringVar(value="1")
@@ -844,7 +1210,7 @@ class SuryaSimpleGUI:
         
         # Настройки автоповтора
         retry_frame = ttk.Frame(main_frame)
-        retry_frame.grid(row=row, column=1, sticky=(tk.W, tk.E), padx=5)
+        retry_frame.grid(row=row, column=1, sticky="ew", padx=5)
         
         self.auto_retry_var = tk.BooleanVar(value=True)
         self.auto_retry_checkbox = ttk.Checkbutton(
@@ -862,7 +1228,7 @@ class SuryaSimpleGUI:
         
         # Настройки LLM
         llm_frame = ttk.LabelFrame(main_frame, text="Настройки LLM", padding="10")
-        llm_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        llm_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=5)
         
         # Выбор провайдера
         ttk.Label(llm_frame, text="Провайдер:").grid(row=0, column=0, sticky="w", padx=(0, 10))
@@ -913,12 +1279,12 @@ class SuryaSimpleGUI:
         # Индикатор прогресса
         ttk.Label(main_frame, text="Прогресс:").grid(row=row, column=0, sticky=tk.W, pady=5)
         self.progress = ttk.Progressbar(main_frame, mode='determinate')
-        self.progress.grid(row=row, column=1, columnspan=2, sticky=(tk.W, tk.E), padx=5)
+        self.progress.grid(row=row, column=1, columnspan=2, sticky="ew", padx=5)
         row += 1
         
         # Блок статистики
         stats_frame = ttk.LabelFrame(main_frame, text="Статистика обработки", padding="10")
-        stats_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        stats_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=5)
         
         # Левая колонка - OCR статистика
         ocr_stats_frame = ttk.Frame(stats_frame)
@@ -973,7 +1339,7 @@ class SuryaSimpleGUI:
         row += 1
         
         self.log_text = scrolledtext.ScrolledText(main_frame, height=20, width=80)
-        self.log_text.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.log_text.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=5)
         row += 1
         
         # Кнопка сохранения лога
@@ -986,13 +1352,124 @@ class SuryaSimpleGUI:
         # Начальная настройка провайдера
         self.on_provider_change()
         
+        # Начальная настройка режима выбора файлов
+        self.on_mode_change()
+        
     def select_pdf_folder(self):
-        folder = filedialog.askdirectory()
+        folder = filedialog.askdirectory(title="Выберите папку с PDF файлами")
         if folder:
             self.pdf_folder.set(folder)
             
+    def select_pdf_files(self):
+        """Выбор отдельных PDF файлов"""
+        files = filedialog.askopenfilenames(
+            title="Выберите PDF файлы",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        if files:
+            self.selected_files.extend(files)
+            # Удаляем дубликаты
+            self.selected_files = list(set(self.selected_files))
+            self.update_files_count()
+            
+    def clear_selected_files(self):
+        """Очистка списка выбранных файлов"""
+        self.selected_files = []
+        self.update_files_count()
+        
+    def update_files_count(self):
+        """Обновление счетчика выбранных файлов"""
+        count = len(self.selected_files)
+        self.files_count_label.config(text=f"Файлов: {count}")
+        
+    def on_mode_change(self):
+        """Обработка смены режима выбора файлов"""
+        mode = self.file_selection_mode.get()
+        
+        if mode == "folder":
+            # Показываем элементы для работы с папкой
+            self.folder_label.grid()
+            self.folder_entry.grid()
+            self.folder_button.grid()
+            self.recursive_frame.grid()
+            self.recursive_checkbox.grid()
+            
+            # Скрываем элементы для работы с файлами
+            files_button_frame = getattr(self, 'files_button_frame', None)
+            if files_button_frame:
+                files_button_frame.grid_remove()
+            
+        else:  # "files"
+            # Скрываем элементы для работы с папкой
+            self.folder_label.grid_remove()
+            self.folder_entry.grid_remove()
+            self.folder_button.grid_remove()
+            self.recursive_frame.grid_remove()
+            
+            # Показываем элементы для работы с файлами
+            files_button_frame = getattr(self, 'files_button_frame', None)
+            if files_button_frame:
+                files_button_frame.grid()
+                self.select_files_button.pack(side=tk.LEFT)
+                self.clear_files_button.pack(side=tk.LEFT, padx=(10, 0))
+                self.files_count_label.pack(side=tk.LEFT, padx=(10, 0))
+            
+    def get_pdf_files_list(self):
+        """Получение списка PDF файлов: КОМБИНИРУЕТ папку И отдельные файлы"""
+        mode = self.file_selection_mode.get()
+        
+        # Инициализируем списки для комбинирования
+        all_file_names = []
+        all_file_paths = {}
+        
+        # ЧАСТЬ 1: Обработка папки (если указана)
+        pdf_folder = self.pdf_folder.get()
+        if pdf_folder and os.path.exists(pdf_folder):
+            folder_files = []
+            
+            if self.recursive_search.get():
+                # Рекурсивный поиск
+                for root, dirs, files in os.walk(pdf_folder):
+                    for file in files:
+                        if file.lower().endswith('.pdf'):
+                            folder_files.append(os.path.join(root, file))
+                
+                # Добавляем файлы из рекурсивного поиска
+                for file_path in folder_files:
+                    file_name = os.path.basename(file_path)
+                    if file_name not in all_file_names:  # Избегаем дубликатов
+                        all_file_names.append(file_name)
+                        all_file_paths[file_name] = os.path.dirname(file_path)
+            else:
+                # Обычный поиск только в указанной папке
+                folder_files = [f for f in os.listdir(pdf_folder) if f.lower().endswith('.pdf')]
+                
+                # Добавляем файлы из папки
+                for file_name in folder_files:
+                    if file_name not in all_file_names:  # Избегаем дубликатов
+                        all_file_names.append(file_name)
+                        all_file_paths[file_name] = pdf_folder
+        
+        # ЧАСТЬ 2: Обработка отдельных файлов (если выбраны)
+        if self.selected_files:
+            for file_path in self.selected_files:
+                file_name = os.path.basename(file_path)
+                if file_name not in all_file_names:  # Избегаем дубликатов
+                    all_file_names.append(file_name)
+                    all_file_paths[file_name] = os.path.dirname(file_path)
+        
+        # РЕЗУЛЬТАТ: Возвращаем объединенный список
+        if not all_file_names:
+            return [], None
+        
+        # Если есть специальные пути, возвращаем их
+        if all_file_paths:
+            return all_file_names, all_file_paths
+        else:
+            return all_file_names, None
+            
     def select_json_folder(self):
-        folder = filedialog.askdirectory()
+        folder = filedialog.askdirectory(title="Выберите папку для JSON файлов")
         if folder:
             self.json_folder.set(folder)
             
@@ -1152,19 +1629,27 @@ class SuryaSimpleGUI:
     def initialize_surya(self):
         """Инициализация предикторов Surya (в каждом процессе)"""
         self.det_predictor = DetectionPredictor()
-        self.rec_predictor = RecognitionPredictor()
+        self.foundation_predictor = FoundationPredictor()
+        self.rec_predictor = RecognitionPredictor(self.foundation_predictor)
         
     def process_pdf_with_surya(self, pdf_path):
         """Обработка PDF с Surya OCR, возвращает данные по страницам"""
         try:
             images, names = load_from_file(pdf_path)
             task_names = [TaskNames.ocr_with_boxes] * len(images)
-            predictions = self.rec_predictor(
-                images,
-                task_names=task_names,
-                det_predictor=self.det_predictor,
-                math_mode=False
-            )
+            # Инициализируем предикторы, если не инициализированы
+            if self.rec_predictor is None or self.det_predictor is None:
+                self.initialize_surya()
+            
+            if self.rec_predictor is not None:
+                predictions = self.rec_predictor(
+                    images,
+                    task_names=task_names,
+                    det_predictor=self.det_predictor,
+                    math_mode=False
+                )
+            else:
+                raise Exception("Не удалось инициализировать Surya OCR")
             
             pages_data = []
             combined_text = ""
@@ -1419,11 +1904,21 @@ class SuryaSimpleGUI:
     def process_files(self):
         """Основная функция: параллельная обработка с multiprocessing"""
         try:
-            pdf_folder = self.pdf_folder.get()
             json_folder = self.json_folder.get()
             
-            if not pdf_folder or not json_folder:
-                self.log("Ошибка: Не выбраны папки")
+            if not json_folder:
+                self.log("Ошибка: Не выбрана папка для JSON файлов")
+                return
+            
+            # Получаем список файлов в зависимости от режима
+            pdf_files, file_paths = self.get_pdf_files_list()
+            
+            if not pdf_files:
+                mode = self.file_selection_mode.get()
+                if mode == "files":
+                    self.log("Ошибка: Не выбраны файлы для обработки")
+                else:
+                    self.log("Ошибка: Нет PDF файлов в выбранной папке")
                 return
                 
             # Получаем настройки потоков из GUI
@@ -1448,12 +1943,6 @@ class SuryaSimpleGUI:
             self.update_document_type_count("")  # Обновляем GUI
             
             os.makedirs(json_folder, exist_ok=True)
-            
-            pdf_files = [f for f in os.listdir(pdf_folder) if f.lower().endswith('.pdf')]
-            
-            if not pdf_files:
-                messagebox.showwarning("Предупреждение", "Нет PDF файлов")
-                return
                 
             self.total_files = len(pdf_files)
             self.processed_files = 0
@@ -1477,7 +1966,11 @@ class SuryaSimpleGUI:
             
             # Заполняем очередь PDF
             for pdf_file in pdf_files:
-                pdf_queue.put((pdf_file, pdf_folder, self.date_format.get()))
+                if file_paths:  # Если есть специальные пути (отдельные файлы или рекурсивный поиск)
+                    pdf_folder_for_file = file_paths[pdf_file]
+                else:  # Обычная папка
+                    pdf_folder_for_file = self.pdf_folder.get()
+                pdf_queue.put((pdf_file, pdf_folder_for_file, self.date_format.get()))
             
             # Проверяем флаг остановки
             if self.stop_processing:
@@ -1735,14 +2228,23 @@ class SuryaSimpleGUI:
     def save_log(self):
         try:
             log_content = self.log_text.get(1.0, tk.END)
-            filename = f"surya_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             
-            with open(filename, 'w', encoding='utf-8') as f:
+            # Используем папку JSON, если она указана, иначе текущую директорию
+            json_folder = self.json_folder.get()
+            if json_folder and os.path.exists(json_folder):
+                log_dir = json_folder
+            else:
+                log_dir = "."  # Текущая директория как fallback
+            
+            filename = f"surya_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            log_path = os.path.join(log_dir, filename)
+            
+            with open(log_path, 'w', encoding='utf-8') as f:
                 f.write(log_content)
                 
-            messagebox.showinfo("Сохранено", f"Лог в: {filename}")
+            messagebox.showinfo("Сохранено", f"Лог сохранен в: {log_path}")
         except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
+            messagebox.showerror("Ошибка", f"Не удалось сохранить лог: {str(e)}")
 
 
 def main():
